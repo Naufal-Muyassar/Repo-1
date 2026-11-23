@@ -1,0 +1,77 @@
+services:
+  - type: web
+    name: 2m-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: .
+    dockerCommand: sh -c "node --import tsx scripts/db.ts migrate && node --import tsx src/server.ts"
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: development
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: "true"
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_BUCKET
+        value: proofs
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_FORCE_PATH_STYLE
+        value: "true"
+      - key: REDIS_URL
+        sync: false
+      - key: PAYMENT_PROVIDER
+        value: mock
+      - key: DEMO_MODE
+        value: "true"
+      - key: CUSTOMER_WEB_URL
+        sync: false
+
+  - type: web
+    name: 2m-courier-pwa
+    runtime: static
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter courier-pwa build
+    staticPublishPath: apps/courier-pwa/dist
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://twom-online-shopping.onrender.com/api/*
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  - type: web
+    name: 2m-admin-web
+    runtime: static
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter admin-web build
+    staticPublishPath: apps/admin-web/dist
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://twom-online-shopping.onrender.com/api/*
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  - type: web
+    name: 2m-customer-web
+    runtime: static
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter customer-web build
+    staticPublishPath: apps/customer-web/dist
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://twom-online-shopping.onrender.com/api/*
+      - type: rewrite
+        source: /*
+        destination: /index.html

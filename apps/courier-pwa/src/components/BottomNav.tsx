@@ -1,0 +1,27 @@
+import { Link, useLocation } from "react-router-dom";
+import { FaCommentDots, FaHistory, FaHome, FaUser } from "react-icons/fa";
+import { unreadIn, useChatThreads } from "@/features/chat/hooks";
+
+const TABS = [
+  { to: "/", label: "Beranda", Icon: FaHome },
+  { to: "/history", label: "Riwayat", Icon: FaHistory },
+  { to: "/chat", label: "Chat", Icon: FaCommentDots },
+  { to: "/profile", label: "Profil", Icon: FaUser },
+] as const;
+
+export function BottomNav() {
+  const { pathname } = useLocation();
+  const unread = unreadIn(useChatThreads().data);
+
+  return (
+    <nav aria-label="Navigasi utama" className="dock">
+      {TABS.map(({ to, label, Icon }) => (
+        <Link key={to} to={to} aria-label={label} aria-current={pathname === to ? "page" : undefined} className="dock-tab">
+          <Icon aria-hidden="true" className="shrink-0" />
+          <span className="dock-tab-label">{label}</span>
+          {to === "/chat" && unread > 0 && <span className="count-badge right-2 top-1">{unread}</span>}
+        </Link>
+      ))}
+    </nav>
+  );
+}

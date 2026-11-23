@@ -1,0 +1,80 @@
+import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
+import { BottomNav } from "@/components/BottomNav";
+import { BalancePage } from "@/features/balance/BalancePage";
+import { LoginPage } from "@/features/session/LoginPage";
+import { ProfilePage } from "@/features/session/ProfilePage";
+import { AdminChatPage, ChatRoomPage } from "@/features/chat/ChatRoom";
+import { ChatListPage } from "@/features/chat/ChatListPage";
+import { HistoryPage } from "@/features/tasks/HistoryPage";
+import { HomePage } from "@/features/tasks/HomePage";
+import { OrderDetailPage } from "@/features/tasks/OrderDetailPage";
+import { useMe, useOrders } from "@/features/tasks/hooks";
+import { useForegroundPings, useWakeLock } from "@/tracking";
+import { usePwaUpdate } from "@/pwa";
+import { FaSyncAlt } from "react-icons/fa";
+import { useSession } from "@/features/session/session";
+
+function UpdateBanner({ onDelivery }: { onDelivery: boolean }) {
+  const { available, updating, applyUpdate } = usePwaUpdate();
+  if (!available) return null;
+  // A reload mid-delivery could drop a proof photo that has not been sent yet, so the update waits.
+  // No dead button in the meantime: the sentence says when it becomes possible.
+  if (onDelivery) {
+    return (
+      <p role="status" className="notice mx-4 mt-3">
+        Versi baru tersedia. Tombol Perbarui muncul setelah pengantaran selesai.
+      </p>
+    );
+  }
+  return (
+    <div role="status" className="notice mx-4 mt-3 flex items-center justify-between gap-3">
+      <span>Versi baru tersedia.</span>
+      <button type="button" disabled={updating} onClick={applyUpdate} className="btn btn-primary shrink-0">
+        <FaSyncAlt aria-hidden="true" className={updating ? "animate-spin motion-reduce:animate-none" : undefined} />
+        {updating ? "Memperbarui…" : "Perbarui"}
+      </button>
+    </div>
+  );
+}
+
+function Shell() {
+  const { loading, user } = useSession();
+  const { pathname } = useLocation();
+  const sessionReady = !loading && user !== null;
+  const me = useMe(sessionReady);
+  const orders = useOrders(sessionReady);
+  const active = orders.data?.active.find((o) => o.status === "ON_DELIVERY" || o.status === "ASSIGNED");
+  const hasOnDelivery = orders.data?.active.some((o) => o.status === "ON_DELIVERY") ?? false;
+  const onDelivery = me.data?.status === "DELIVERING" || hasOnDelivery;
+  const showNav = user !== null && (pathname === "/" || pathname === "/history" || pathname === "/chat" || pathname === "/profile");
+
+  useForegroundPings(me.data?.status, active?.id, active?.status === "ON_DELIVERY");
+  useWakeLock(hasOnDelivery);
+
+  return (
+    <div className={showNav ? "app-shell" : "app-shell-plain"}>
+      <UpdateBanner onDelivery={onDelivery} />
+      <Outlet />
+      {showNav && <BottomNav />}
+    </div>
+  );
+}
+
+export function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route element={<Shell />}>
+        <Route path="/" element={<HomePage />} />
+        <Route path="/history" element={<HistoryPage />} />
+        <Route path="/profile" element={<ProfilePage />} />
+        <Route path="/balance" element={<BalancePage />} />
+        <Route path="/chat" element={<ChatListPage />} />
+        <Route path="/chat/admin" element={<AdminChatPage />} />
+        <Route path="/chat/:threadId" element={<ChatRoomPage />} />
+        <Route path="/orders/:id" element={<OrderDetailPage />} />
+      </Route>
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}

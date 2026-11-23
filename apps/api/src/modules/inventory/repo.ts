@@ -1,0 +1,166 @@
+import type { Pool } from "pg";
+import type { Tx } from "../../shared/db";
+
+type Db = Pool | Tx;
+
+export interface StockItem {
+  branchId: string;
+  productId: string;
+  qty: number;
+}
+
+export interface SellableRow {
+  branch_id: string;
+  product_id: string;
+  sellable: number;
+}
+
+// sellable = snapshot - (ACTIVE + COMMITTED reservations) - buffer. Not clamped: Redis counters must stay
+// symmetric with release increments, so callers clamp for display only. No snapshot row means no stock.
+// Both fragments expect branch_products aliased as bp; the catalog listing reuses them so there is one formula.
+export const SELLABLE_JOINS = `
+     LEFT JOIN stock_snapshots s ON s.branch_id = bp.branch_id AND s.product_id = bp.product_id
+     LEFT JOIN (
+       SELECT branch_id, product_id, sum(qty) AS held
+       FROM stock_reservations
+       WHERE status IN ('ACTIVE', 'COMMITTED')
+       GROUP BY branch_id, product_id
+     ) r ON r.branch_id = bp.branch_id AND r.product_id = bp.product_id`;
+export const SELLABLE_EXPR = `(COALESCE(s.qty, 0) - bp.stock_buffer - COALESCE(r.held, 0))::int`;
+
+// Pass null to cover every branch product.
+export async function computeSellable(db: Db, scope: { branchId: string; productIds: readonly string[] } | null): Promise<SellableRow[]> {
+  const res = await db.query<SellableRow>(
+    `SELECT bp.branch_id, bp.product_id, ${SELLABLE_EXPR} AS sellable
+     FROM branch_products bp${SELLABLE_JOINS}
+     WHERE ($1::uuid IS NULL OR (bp.branch_id = $1 AND bp.product_id = ANY($2::uuid[])))`,
+    [scope?.branchId ?? null, scope?.productIds ?? []],
+  );
+  return res.rows;
+}
+
+export async function insertReservations(
+  tx: Tx,
+  r: { orderId: string; ttlSec: number; items: readonly StockItem[] },
+): Promise<void> {
+  for (const i of r.items) {
+    await tx.query(
+      `INSERT INTO stock_reservations (order_id, product_id, branch_id, qty, expires_at)
+       VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))`,
+      [r.orderId, i.productId, i.branchId, i.qty, r.ttlSec],
+    );
+  }
+}
+
+export async function attachInvoice(tx: Tx, orderId: string, invoiceId: string): Promise<void> {
+  await tx.query(`UPDATE stock_reservations SET invoice_id = $2 WHERE order_id = $1`, [orderId, invoiceId]);
+}
+
+export async function hasReservations(db: Db, orderId: string): Promise<boolean> {
+  const res = await db.query(`SELECT 1 FROM stock_reservations WHERE order_id = $1 LIMIT 1`, [orderId]);
+  return res.rowCount === 1;
+}
+
+const toItems = (rows: { branch_id: string; product_id: string; qty: number }[]): StockItem[] =>
+  rows.map((r) => ({ branchId: r.branch_id, productId: r.product_id, qty: r.qty }));
+
+// Idempotent: only rows still ACTIVE are touched, and the returned rows are what the caller must give back to Redis.
+export async function releaseActive(db: Db, orderId: string): Promise<StockItem[]> {
+  const res = await db.query(
+    `UPDATE stock_reservations SET status = 'RELEASED', updated_at = now()
+     WHERE order_id = $1 AND status = 'ACTIVE'
+     RETURNING branch_id, product_id, qty`,
+    [orderId],
+  );
+  return toItems(res.rows);
+}
+
+// A cancelled order never leaves the branch, so units already sold to it (COMMITTED) come back as well.
+export async function releaseHeld(db: Db, orderId: string): Promise<StockItem[]> {
+  const res = await db.query(
+    `UPDATE stock_reservations SET status = 'RELEASED', updated_at = now()
+     WHERE order_id = $1 AND status IN ('ACTIVE', 'COMMITTED')
+     RETURNING branch_id, product_id, qty`,
+    [orderId],
+  );
+  return toItems(res.rows);
+}
+
+// Postgres-side guard for a checkout that Redis admitted. Locks the snapshot rows of the order's products in a fixed
+// order (no deadlock between multi-SKU carts), then recomputes sellable in a new statement: under READ COMMITTED it
+// sees every reservation committed by earlier lock holders plus this transaction's own rows. A negative value means
+// Redis let through more than Postgres holds, and the caller must refuse the checkout.
+export async function lockAndComputeSellable(tx: Tx, branchId: string, productIds: readonly string[]): Promise<SellableRow[]> {
+  await tx.query(
+    `SELECT 1 FROM stock_snapshots WHERE branch_id = $1 AND product_id = ANY($2::uuid[]) ORDER BY product_id FOR UPDATE`,
+    [branchId, productIds],
+  );
+  return computeSellable(tx, { branchId, productIds });
+}
+
+// Order statuses whose payment outcome is still open. Their reservations are never released on a timer: the
+// payment state machine (PAYMENT_EXPIRED / CANCELLED) or reconciliation decides, so a payment that lands late
+// always finds its units still held.
+export const PAYMENT_OPEN_STATUSES = ["CREATED", "PENDING_PAYMENT"] as const;
+const RELEASABLE_STATUSES = ["CANCELLED", "FAILED"] as const;
+
+// Safety net for an outbox handler that never ran: only orders that will not be paid any more give units back.
+export async function releaseExpired(db: Db, limit: number): Promise<StockItem[]> {
+  const res = await db.query(
+    `WITH due AS (
+       SELECT r.order_id, r.product_id FROM stock_reservations r
+       JOIN orders o ON o.id = r.order_id
+       WHERE r.status = 'ACTIVE' AND r.expires_at < now() AND o.status = ANY($2::order_status[])
+       ORDER BY r.expires_at
+       LIMIT $1
+       FOR UPDATE OF r SKIP LOCKED
+     )
+     UPDATE stock_reservations r SET status = 'RELEASED', updated_at = now()
+     FROM due WHERE r.order_id = due.order_id AND r.product_id = due.product_id AND r.status = 'ACTIVE'
+     RETURNING r.branch_id, r.product_id, r.qty`,
+    [limit, RELEASABLE_STATUSES],
+  );
+  return toItems(res.rows);
+}
+
+// Paid (or later) orders whose PAYMENT_SUCCESS handler has not committed the reservation yet.
+export async function listPaidUncommitted(db: Db, limit: number): Promise<string[]> {
+  const res = await db.query<{ order_id: string }>(
+    `SELECT DISTINCT r.order_id FROM stock_reservations r
+     JOIN orders o ON o.id = r.order_id
+     WHERE r.status = 'ACTIVE' AND r.expires_at < now()
+       AND NOT (o.status = ANY($2::order_status[])) AND NOT (o.status = ANY($3::order_status[]))
+     LIMIT $1`,
+    [limit, PAYMENT_OPEN_STATUSES, RELEASABLE_STATUSES],
+  );
+  return res.rows.map((r) => r.order_id);
+}
+
+export interface CommitResult {
+  committed: StockItem[];
+  releasedBeforePayment: boolean;
+}
+
+export async function commitActive(db: Db, orderId: string): Promise<CommitResult> {
+  await db.query(
+    `UPDATE stock_reservations SET status = 'COMMITTED', updated_at = now() WHERE order_id = $1 AND status = 'ACTIVE'`,
+    [orderId],
+  );
+  const res = await db.query<{ branch_id: string; product_id: string; qty: number; status: string }>(
+    `SELECT branch_id, product_id, qty, status FROM stock_reservations WHERE order_id = $1`,
+    [orderId],
+  );
+  return {
+    committed: toItems(res.rows.filter((r) => r.status === "COMMITTED")),
+    releasedBeforePayment: res.rows.some((r) => r.status === "RELEASED"),
+  };
+}
+
+// Stand-in for a central-stock refresh; also used by tests and seeds.
+export async function upsertSnapshot(db: Db, branchId: string, productId: string, qty: number): Promise<void> {
+  await db.query(
+    `INSERT INTO stock_snapshots (branch_id, product_id, qty) VALUES ($1, $2, $3)
+     ON CONFLICT (branch_id, product_id) DO UPDATE SET qty = EXCLUDED.qty, updated_at = now()`,
+    [branchId, productId, qty],
+  );
+}
